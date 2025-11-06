@@ -212,4 +212,4 @@ if user_input and st.session_state.chat_session:
         st.session_state.chat_log.append(("Bot", reply, get_time()))
 
     st.rerun()
-    
+#hi
