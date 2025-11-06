@@ -5,23 +5,21 @@ import google.generativeai as genai
 import random
 import time
 
-# === API Setup ===
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or "AIzaSyBfbyNpxQvoLmRbrpufY5gxzT3zoLLYCFU"
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-2.0-flash")
-chat_session = model.start_chat(history=[])
+# === Function to Initialize Gemini API Securely ===
+def setup_gemini(api_key: str):
+    """Configure Gemini API safely."""
+    genai.configure(api_key=api_key)
+    return genai.GenerativeModel("gemini-2.0-flash").start_chat(history=[])
 
 # === Utility Functions ===
 def get_time():
-    """Returns the current time in a friendly format."""
     return datetime.now().strftime("%I:%M %p")
 
 def load_sticker():
-    """Random emoji for a friendly touch."""
     return random.choice(["✨", "💬", "🌟", "😊", "👍", "🦾", "🎉", "🤖"])
 
 def typing_effect(text, container, delay=0.02):
-    """Simulates typing animation for bot replies."""
+    """Simulate typing animation."""
     output = ""
     for char in text:
         output += char
@@ -45,29 +43,58 @@ themes = {
 # === Streamlit Config ===
 st.set_page_config(page_title="AI-Assistant", page_icon="💬", layout="centered")
 
-# === Session State Initialization ===
+# === Session State ===
 if "chat_log" not in st.session_state:
     st.session_state.chat_log = []
 if "theme" not in st.session_state:
     st.session_state.theme = "Light"
 if "intro_shown" not in st.session_state:
     st.session_state.intro_shown = False
+if "chat_session" not in st.session_state:
+    st.session_state.chat_session = None
+if "api_key" not in st.session_state:
+    st.session_state.api_key = os.getenv("GEMINI_API_KEY", "")
 
 # === Sidebar ===
 with st.sidebar:
+    st.header("⚙️ Settings")
+
+    # API Key Section
+    st.markdown("### 🔑 Gemini API Key")
+    st.session_state.api_key = st.text_input(
+        "Enter your Gemini API key",
+        value=st.session_state.api_key,
+        type="password",
+        placeholder="sk-...",
+        help="Your API key is stored securely in this session."
+    )
+
+    if st.session_state.api_key:
+        os.environ["GEMINI_API_KEY"] = st.session_state.api_key
+        try:
+            st.session_state.chat_session = setup_gemini(st.session_state.api_key)
+            st.success("✅ API connected successfully!")
+        except Exception as e:
+            st.error(f"❌ Invalid API key: {str(e)}")
+    else:
+        st.warning("⚠️ Please enter your Gemini API key to start chatting.")
+
+    st.markdown("---")
     st.header("🎨 Theme Settings")
-    selected_theme = st.selectbox("Choose Theme", list(themes.keys()), index=list(themes.keys()).index(st.session_state.theme))
+    selected_theme = st.selectbox(
+        "Choose Theme", list(themes.keys()),
+        index=list(themes.keys()).index(st.session_state.theme)
+    )
     st.session_state.theme = selected_theme
     theme = themes[selected_theme]
 
-    st.markdown(f"🕒 **Time:** {datetime.now().strftime('%A, %d %B %Y %I:%M %p')}")
+    st.markdown(f"🕒 **{datetime.now().strftime('%A, %d %B %Y %I:%M %p')}**")
 
     if st.button("🧹 Clear Chat"):
         st.session_state.chat_log.clear()
         st.session_state.intro_shown = False
         st.rerun()
 
-    # Chat log download button
     st.download_button(
         "📥 Download Chat",
         data="\n".join([f"[{t}] {s}: {m}" for s, m, t in st.session_state.chat_log]),
@@ -137,10 +164,15 @@ st.markdown(f"""
     </style>
 """, unsafe_allow_html=True)
 
-# === Main Title ===
+# === Title ===
 st.title("💬 AI-Assistant")
 
-# === Intro Message (once only) ===
+# === Guard Clause: Require API Key ===
+if not st.session_state.api_key:
+    st.info("🔐 Please enter your Gemini API key in the sidebar to start chatting.")
+    st.stop()
+
+# === Intro Message ===
 if not st.session_state.intro_shown:
     intro_msg = "👋 Hey hey! I’m AI-Assistant — your chat buddy 🤖✨ Ask me anything, anytime!"
     placeholder = st.empty()
@@ -149,7 +181,7 @@ if not st.session_state.intro_shown:
     st.session_state.intro_shown = True
     st.rerun()
 
-# === Chat History Display ===
+# === Display Chat Log ===
 for sender, message, timestamp in st.session_state.chat_log:
     sender_class = "user" if sender == "User" else "bot"
     st.markdown(
@@ -158,20 +190,19 @@ for sender, message, timestamp in st.session_state.chat_log:
     )
     st.markdown(f"<div class='timestamp'>[{timestamp}] {sender}</div>", unsafe_allow_html=True)
 
-# === User Input ===
+# === Chat Input ===
 user_input = st.chat_input("Type your message...")
 
-if user_input:
+if user_input and st.session_state.chat_session:
     timestamp = get_time()
     st.session_state.chat_log.append(("User", user_input, timestamp))
 
     with st.spinner("AI-Assistant is typing..."):
         try:
-            # Use Gemini chat session context properly
-            response = chat_session.send_message(user_input)
+            response = st.session_state.chat_session.send_message(user_input)
             raw_reply = response.text.strip()
         except Exception as e:
-            raw_reply = "⚠️ Oops! Something went wrong. Try again later."
+            raw_reply = f"⚠️ Oops! Something went wrong: {str(e)}"
 
         sticker = load_sticker()
         reply = f"{raw_reply} {sticker}" if raw_reply else "🤖 Sorry, I didn’t get that."
@@ -181,3 +212,4 @@ if user_input:
         st.session_state.chat_log.append(("Bot", reply, get_time()))
 
     st.rerun()
+    
