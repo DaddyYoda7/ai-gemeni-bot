@@ -1,215 +1,351 @@
+# improved_aibot.py
 import os
+import json
+import time
+import random
 import streamlit as st
 from datetime import datetime
+from typing import Optional, List, Dict, Any
+from dotenv import load_dotenv
 import google.generativeai as genai
-import random
-import time
+from google.api_core import exceptions as google_exceptions
 
-# === Function to Initialize Gemini API Securely ===
-def setup_gemini(api_key: str):
-    """Configure Gemini API safely."""
-    genai.configure(api_key=api_key)
-    return genai.GenerativeModel("gemini-2.0-flash").start_chat(history=[])
+# ---------------------------
+# Configuration / Constants
+# ---------------------------
+load_dotenv()  # load .env if present
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+CHAT_HISTORY_FILE = "chat_history.json"
+DEFAULT_MODEL = "gemini-2.0-flash"
 
-# === Utility Functions ===
-def get_time():
+# System persona & behavior
+SYSTEM_PROMPT = (
+    "You are AI-Assistant, a friendly, helpful chatbot. "
+    "Be concise, use emojis moderately, and prefer plain language similar to chat/DM style. "
+    "When asked for code include code blocks. Always be helpful and factual."
+)
+
+# Limits & behavior tuning
+MAX_MESSAGES_BEFORE_SUMMARY = 18   # when exceeded, older messages will be summarized
+SUMMARY_PROMPT = "Summarize the following conversation briefly (2-3 sentences) preserving important facts and any user's preferences."
+
+# Retry/backoff config
+MAX_RETRIES = 5
+INITIAL_BACKOFF = 1.0  # seconds
+BACKOFF_MULTIPLIER = 2.0
+
+# ---------------------------
+# Helper utilities
+# ---------------------------
+def timestamp() -> str:
     return datetime.now().strftime("%I:%M %p")
 
-def load_sticker():
-    return random.choice(["✨", "💬", "🌟", "😊", "👍", "🦾", "🎉", "🤖"])
-
-def typing_effect(text, container, delay=0.02):
-    """Simulate typing animation."""
-    output = ""
-    for char in text:
-        output += char
-        container.markdown(
-            f"<div class='chat-container bot'><div class='bubble'><span>{output}<span class='blink'>▌</span></span></div></div>",
-            unsafe_allow_html=True
-        )
-        time.sleep(delay)
-    container.markdown(
-        f"<div class='chat-container bot'><div class='bubble'>{output}</div></div>",
-        unsafe_allow_html=True
-    )
-
-# === Themes ===
-themes = {
-    "Light": {"user_bg": "#e1f5fe", "bot_bg": "#fce4ec", "text_color": "#000", "bg_color": "#fafafa"},
-    "Dark": {"user_bg": "#2c2c2c", "bot_bg": "#3a3a3a", "text_color": "#fff", "bg_color": "#1e1e1e"},
-    "Sunset": {"user_bg": "#ffcccb", "bot_bg": "#ffe4b5", "text_color": "#000", "bg_color": "#fff5ee"}
-}
-
-# === Streamlit Config ===
-st.set_page_config(page_title="AI-Assistant", page_icon="💬", layout="centered")
-
-# === Session State ===
-if "chat_log" not in st.session_state:
-    st.session_state.chat_log = []
-if "theme" not in st.session_state:
-    st.session_state.theme = "Light"
-if "intro_shown" not in st.session_state:
-    st.session_state.intro_shown = False
-if "chat_session" not in st.session_state:
-    st.session_state.chat_session = None
-if "api_key" not in st.session_state:
-    st.session_state.api_key = os.getenv("GEMINI_API_KEY", "")
-
-# === Sidebar ===
-with st.sidebar:
-    st.header("⚙️ Settings")
-
-    # API Key Section
-    st.markdown("### 🔑 Gemini API Key")
-    st.session_state.api_key = st.text_input(
-        "Enter your Gemini API key",
-        value=st.session_state.api_key,
-        type="password",
-        placeholder="sk-...",
-        help="Your API key is stored securely in this session."
-    )
-
-    if st.session_state.api_key:
-        os.environ["GEMINI_API_KEY"] = st.session_state.api_key
+def load_history(filepath: str = CHAT_HISTORY_FILE) -> List[Dict[str, Any]]:
+    if os.path.exists(filepath):
         try:
-            st.session_state.chat_session = setup_gemini(st.session_state.api_key)
-            st.success("✅ API connected successfully!")
+            with open(filepath, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+def save_history(history: List[Dict[str, Any]], filepath: str = CHAT_HISTORY_FILE) -> None:
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass  # don't fail the UI if disk save fails
+
+def exponential_backoff_call(func, *args, **kwargs):
+    """
+    Call func(*args, **kwargs) with exponential backoff for rate-limit and transient errors.
+    Returns (result, error) where error is None if success.
+    """
+    backoff = INITIAL_BACKOFF
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            res = func(*args, **kwargs)
+            return res, None
+        except google_exceptions.ResourceExhausted as e:
+            # Rate limit — advise user and retry after backoff
+            if attempt == MAX_RETRIES:
+                return None, e
+            time.sleep(backoff)
+            backoff *= BACKOFF_MULTIPLIER
+            continue
+        except google_exceptions.ServiceUnavailable as e:
+            if attempt == MAX_RETRIES:
+                return None, e
+            time.sleep(backoff)
+            backoff *= BACKOFF_MULTIPLIER
+            continue
         except Exception as e:
-            st.error(f"❌ Invalid API key: {str(e)}")
-    else:
-        st.warning("⚠️ Please enter your Gemini API key to start chatting.")
+            # For other errors, don't aggressively retry — return the error
+            return None, e
+    return None, Exception("Max retries exceeded")
 
-    st.markdown("---")
-    st.header("🎨 Theme Settings")
-    selected_theme = st.selectbox(
-        "Choose Theme", list(themes.keys()),
-        index=list(themes.keys()).index(st.session_state.theme)
-    )
-    st.session_state.theme = selected_theme
-    theme = themes[selected_theme]
-
-    st.markdown(f"🕒 **{datetime.now().strftime('%A, %d %B %Y %I:%M %p')}**")
-
-    if st.button("🧹 Clear Chat"):
-        st.session_state.chat_log.clear()
-        st.session_state.intro_shown = False
-        st.rerun()
-
-    st.download_button(
-        "📥 Download Chat",
-        data="\n".join([f"[{t}] {s}: {m}" for s, m, t in st.session_state.chat_log]),
-        file_name="chat_log.txt",
-        mime="text/plain"
-    )
-
-# === CSS Styling ===
-st.markdown(f"""
-    <style>
-        .chat-container {{
-            display: flex;
-            width: 100%;
-            margin-bottom: 0.5rem;
-        }}
-        .chat-container.user {{
-            justify-content: flex-end;
-        }}
-        .chat-container.bot {{
-            justify-content: flex-start;
-        }}
-        .bubble {{
-            padding: 0.75rem 1rem;
-            border-radius: 1.25rem;
-            font-size: 1rem;
-            max-width: 75%;
-            width: fit-content;
-            animation: fadeIn 0.25s ease-in-out;
-            font-family: 'Segoe UI', sans-serif;
-            word-break: break-word;
-        }}
-        .user .bubble {{
-            background-color: {theme['user_bg']};
-            color: {theme['text_color']};
-            text-align: right;
-        }}
-        .bot .bubble {{
-            background-color: {theme['bot_bg']};
-            color: {theme['text_color']};
-            text-align: left;
-        }}
-        .timestamp {{
-            font-size: 0.7rem;
-            color: #888;
-            text-align: center;
-            margin-bottom: 1rem;
-        }}
-        section.main > div {{
-            background-color: {theme['bg_color']};
-        }}
-        @keyframes fadeIn {{
-            0% {{ opacity: 0; transform: translateY(5px); }}
-            100% {{ opacity: 1; transform: translateY(0); }}
-        }}
-        .blink {{
-            animation: blink 1s step-end infinite;
-        }}
-        @keyframes blink {{
-            50% {{ opacity: 0; }}
-        }}
-        @media (max-width: 600px) {{
-            .bubble {{
-                max-width: 90%;
-                font-size: 0.95rem;
-            }}
-        }}
-    </style>
-""", unsafe_allow_html=True)
-
-# === Title ===
-st.title("💬 AI-Assistant")
-
-# === Guard Clause: Require API Key ===
-if not st.session_state.api_key:
-    st.info("🔐 Please enter your Gemini API key in the sidebar to start chatting.")
+# ---------------------------
+# Set up Gemini client
+# ---------------------------
+if not GEMINI_API_KEY:
+    st.error("Gemini API key not found in environment. Set GEMINI_API_KEY and restart the app.")
     st.stop()
 
-# === Intro Message ===
-if not st.session_state.intro_shown:
-    intro_msg = "👋 Hey hey! I’m AI-Assistant — your chat buddy 🤖✨ Ask me anything, anytime!"
-    placeholder = st.empty()
-    typing_effect(intro_msg, placeholder, delay=0.015)
-    st.session_state.chat_log.append(("Bot", intro_msg, get_time()))
-    st.session_state.intro_shown = True
-    st.rerun()
+try:
+    genai.configure(api_key=GEMINI_API_KEY)
+    model_obj = genai.GenerativeModel(DEFAULT_MODEL)
+except Exception as e:
+    st.error(f"Failed to configure Gemini client: {e}")
+    st.stop()
 
-# === Display Chat Log ===
-for sender, message, timestamp in st.session_state.chat_log:
-    sender_class = "user" if sender == "User" else "bot"
-    st.markdown(
-        f"<div class='chat-container {sender_class}'><div class='bubble'>{message}</div></div>",
-        unsafe_allow_html=True
-    )
-    st.markdown(f"<div class='timestamp'>[{timestamp}] {sender}</div>", unsafe_allow_html=True)
+# ---------------------------
+# Conversation utilities
+# ---------------------------
+def start_chat_session():
+    try:
+        return model_obj.start_chat(history=[])
+    except Exception as e:
+        raise e
 
-# === Chat Input ===
-user_input = st.chat_input("Type your message...")
+def safe_send_message(chat_session, user_text: str):
+    """
+    Send a single user message using the provided chat_session object.
+    Uses exponential backoff for rate limits.
+    """
+    def _send():
+        return chat_session.send_message(user_text)
 
-if user_input and st.session_state.chat_session:
-    timestamp = get_time()
-    st.session_state.chat_log.append(("User", user_input, timestamp))
+    response, err = exponential_backoff_call(_send)
+    return response, err
 
-    with st.spinner("AI-Assistant is typing..."):
+def summarize_history(chat_session, messages: List[Dict[str, Any]]) -> Optional[str]:
+    """
+    Summarize older messages using the model.
+    Returns summary string or None on failure.
+    """
+    try:
+        # Build a single text block to summarize
+        convo_text = "\n".join([f"{m['role']}: {m['text']}" for m in messages])
+        summ_prompt = f"{SUMMARY_PROMPT}\n\n{convo_text}"
+        resp, err = exponential_backoff_call(lambda: chat_session.send_message(summ_prompt))
+        if err or not resp:
+            return None
+        # try extract text safely
+        if hasattr(resp, "text") and resp.text:
+            return resp.text.strip()
+        return str(resp).strip()
+    except Exception:
+        return None
+
+# ---------------------------
+# Streamlit UI & state init
+# ---------------------------
+st.set_page_config(page_title="AI-Assistant (Improved)", page_icon="🤖", layout="wide")
+
+if "history" not in st.session_state:
+    st.session_state.history = load_history()
+if "chat_session" not in st.session_state:
+    # create fresh session
+    try:
+        st.session_state.chat_session = start_chat_session()
+    except Exception as e:
+        st.error(f"Could not create chat session: {e}")
+        st.stop()
+if "system_note" not in st.session_state:
+    st.session_state.system_note = SYSTEM_PROMPT
+if "dev_mode" not in st.session_state:
+    # disable developer debug details by default
+    st.session_state.dev_mode = os.getenv("DEV_MODE", "0") == "1"
+
+# ---------------------------
+# Sidebar controls
+# ---------------------------
+with st.sidebar:
+    st.title("⚙ AI-Assistant")
+    st.markdown("**Settings & Tools**")
+
+    model_choice = st.selectbox("Model", [DEFAULT_MODEL], index=0, help="Change model name if you have other models enabled.")
+    st.write("---")
+    st.markdown("**Appearance**")
+    theme_choice = st.selectbox("Theme", ["Light", "Dark", "Sunset"], index=0)
+    st.write("---")
+    st.markdown("**Conversation**")
+    if st.button("Clear local history"):
+        st.session_state.history = []
+        save_history(st.session_state.history)
+        st.experimental_rerun()
+
+    if st.button("Export chat (JSON)"):
+        save_history(st.session_state.history)
+        st.download_button("Download chat JSON", data=json.dumps(st.session_state.history, ensure_ascii=False, indent=2),
+                           file_name="chat_history.json")
+
+    st.write("---")
+    st.markdown("**Helpers**")
+    if st.button("Summarize long history now"):
+        # run summarization on older messages
+        if len(st.session_state.history) > 6:
+            older = st.session_state.history[:-6]
+            s = summarize_history(st.session_state.chat_session, older)
+            if s:
+                st.success("Summary created and saved as system note.")
+                st.session_state.system_note = s
+                # drop older messages and keep last N
+                st.session_state.history = st.session_state.history[-6:]
+                save_history(st.session_state.history)
+            else:
+                st.warning("Could not summarize right now (try again later).")
+        else:
+            st.info("Not enough history to summarize.")
+    st.write("---")
+    st.checkbox("Developer mode (detailed errors)", value=st.session_state.dev_mode, key="dev_mode")
+
+# ---------------------------
+# Styling (simple)
+# ---------------------------
+st.markdown("""
+<style>
+/* container */
+.chat-wrapper { max-width: 1000px; margin: 0 auto; }
+.row { display:flex; gap:1rem; }
+.col { flex:1; }
+/* bubbles */
+.user-bubble, .bot-bubble {
+  padding: 0.8rem 1rem;
+  border-radius: 14px;
+  max-width: 80%;
+  word-wrap: break-word;
+}
+.user-bubble { background: #e1f5fe; align-self: flex-end; margin-left:auto; }
+.bot-bubble  { background: #f1f1f1; align-self: flex-start; margin-right:auto; }
+.meta { font-size: 0.75rem; color: #666; margin-top:0.25rem; }
+.suggest-btn { margin: 0.2rem; }
+</style>
+""", unsafe_allow_html=True)
+
+# ---------------------------
+# Main UI layout
+# ---------------------------
+st.markdown("<div class='chat-wrapper'>", unsafe_allow_html=True)
+st.header("💬 AI-Assistant — improved")
+
+# suggested prompts row
+suggested = ["Explain machine learning like I'm 5", "Give me a 5-point study plan for superconductivity", "Summarize my previous messages", "Generate a short poem about AI"]
+st.markdown("**Suggested prompts:**")
+cols = st.columns(len(suggested))
+for i, s in enumerate(suggested):
+    if cols[i].button(s, key=f"suggest_{i}", help="Click to send this prompt"):
+        # inject into input
+        st.session_state._prefill = s
+
+# file upload for context
+uploaded = st.file_uploader("Upload a .txt file to include as context (optional)", type=["txt"])
+if uploaded:
+    try:
+        file_text = uploaded.getvalue().decode("utf-8")
+        st.info("File loaded — it will be included as context in the next message.")
+        st.session_state._file_context = file_text
+    except Exception:
+        st.warning("Could not read uploaded file.")
+
+# show conversation area (scrollable)
+st.markdown("### Conversation")
+chat_container = st.container()
+with chat_container:
+    for msg in st.session_state.history:
+        if msg["role"] == "user":
+            st.markdown(f"<div class='user-bubble'>{msg['text']}</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='meta'>[{msg['ts']}] You</div>", unsafe_allow_html=True)
+        else:
+            st.markdown(f"<div class='bot-bubble'>{msg['text']}</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='meta'>[{msg['ts']}] AI-Assistant</div>", unsafe_allow_html=True)
+
+# input area
+st.markdown("---")
+prefill = st.session_state.pop("_prefill", "")
+user_input = st.text_area("Your message", value=prefill, placeholder="Type a message and press Send", key="user_input_area", height=120)
+col1, col2, col3 = st.columns([3, 1, 1])
+with col1:
+    send = st.button("Send")
+with col2:
+    quick1 = st.button("Explain simply")
+with col3:
+    quick2 = st.button("Outline")
+
+# quick replies map
+if quick1:
+    user_input = "Explain this simply: " + (user_input or "the topic")
+if quick2:
+    user_input = "Give me an outline:" + (user_input or "")
+
+if send and user_input:
+    # assemble full user text with optional file context and system note
+    pieces = []
+    if st.session_state.system_note:
+        pieces.append(f"[SYSTEM NOTE] {st.session_state.system_note}")
+    if hasattr(st.session_state, "_file_context"):
+        pieces.append("[FILE CONTEXT]\n" + st.session_state._file_context)
+        # clear file context after using once
+        del st.session_state._file_context
+    pieces.append(f"[USER] {user_input}")
+    full_text = "\n\n".join(pieces)
+
+    # append user message to local history
+    st.session_state.history.append({"role": "user", "text": user_input, "ts": timestamp()})
+    save_history(st.session_state.history)
+
+    # send message (with retry/backoff)
+    with st.spinner("AI-Assistant is thinking..."):
         try:
-            response = st.session_state.chat_session.send_message(user_input)
-            raw_reply = response.text.strip()
+            # create fresh session for each call to avoid stale state and for stability
+            chat_session = start_chat_session()
+            response, err = exponential_backoff_call(lambda: chat_session.send_message(full_text))
+            if err:
+                # handle rate limit specifically
+                if isinstance(err, google_exceptions.ResourceExhausted):
+                    reply_text = ("⚠️ Rate limit reached. Please wait a minute or reduce request frequency. "
+                                  "If this persists, request a quota increase in your Google Cloud project.")
+                else:
+                    reply_text = f"⚠️ Error: {str(err)}"
+                    if st.session_state.dev_mode:
+                        reply_text += f"\n\nDevTrace: {repr(err)}"
+            else:
+                # extract response text
+                if hasattr(response, "text") and response.text:
+                    reply_text = response.text.strip()
+                else:
+                    reply_text = str(response).strip()
         except Exception as e:
-            raw_reply = f"⚠️ Oops! Something went wrong: {str(e)}"
+            reply_text = f"⚠️ Unexpected error: {str(e)}"
+            if st.session_state.dev_mode:
+                import traceback
+                reply_text += "\n\n" + traceback.format_exc(limit=5)
 
-        sticker = load_sticker()
-        reply = f"{raw_reply} {sticker}" if raw_reply else "🤖 Sorry, I didn’t get that."
+    # append bot reply
+    sticker = random.choice(["✨", "💬", "🌟", "😊", "👍", "🦾", "🎉", "🤖"])
+    reply_with_sticker = f"{reply_text} {sticker}"
+    st.session_state.history.append({"role": "assistant", "text": reply_with_sticker, "ts": timestamp()})
+    save_history(st.session_state.history)
 
-        reply_placeholder = st.empty()
-        typing_effect(reply, reply_placeholder, delay=0.015)
-        st.session_state.chat_log.append(("Bot", reply, get_time()))
+    # if history grows too long, summarize older part
+    if len(st.session_state.history) > MAX_MESSAGES_BEFORE_SUMMARY:
+        older_part = st.session_state.history[:-8]
+        recent_part = st.session_state.history[-8:]
+        # summarize older messages
+        try:
+            chat_session = start_chat_session()
+            summary = summarize_history(chat_session, older_part)
+            if summary:
+                st.session_state.system_note = summary
+                # keep only recent part in history (older part summarized into system note)
+                st.session_state.history = recent_part
+                save_history(st.session_state.history)
+                st.success("🔖 Long history summarized to system note to preserve context and reduce token usage.")
+        except Exception:
+            # if summarization fails, keep history as-is
+            pass
 
-    st.rerun()
-#hi
+    # re-render page to show updated messages
+    st.experimental_rerun()
+
+st.markdown("</div>", unsafe_allow_html=True)
