@@ -45,7 +45,7 @@ genai.configure(api_key=GEMINI_API_KEY)
 
 
 # ==============================================================================
-# 2. Styling and Utilities (New GUI Enhancements)
+# 2. Styling and Utilities
 # ==============================================================================
 
 def apply_custom_css():
@@ -262,7 +262,9 @@ User request:
 # 5. Streamlit UI
 # ==============================================================================
 
-# Apply styling first
+st.set_page_config(page_title="Ingres Virtual Assistant 📊", layout="wide")
+
+# Apply styling after set_page_config()
 apply_custom_css()
 
 # Initialize manager and assistant
@@ -282,7 +284,7 @@ def load_db_schema(_assistant, _tables):
 
 schema_context = load_db_schema(assistant, TARGET_TABLES)
 
-st.set_page_config(page_title="Ingres Virtual Assistant 📊", layout="wide")
+
 st.markdown('<p class="main-header">Ingres Virtual Assistant — NL → SQL 🤖</p>', unsafe_allow_html=True)
 
 # Initialize session state for consistent results display
@@ -389,6 +391,7 @@ if submit_button and user_input.strip():
                 st.session_state.execute_write_sql = proposed_sql
                 st.session_state.execute_write_params = params
                 st.session_state.results_data["result"] = "Awaiting Write Confirmation."
+                st.rerun() # Rerun to show confirmation prompt immediately
         else: # SELECT flow
             try:
                 with st.spinner("Executing SELECT query against Ingres..."):
@@ -416,7 +419,16 @@ col1, col2 = st.columns([1, 4])
 
 with col1:
     st.markdown(f"**Status:**")
-    st.success(st.session_state.results_data['result'].split(':')[0]) if "Success" in st.session_state.results_data['result'] else st.warning(st.session_state.results_data['result'].split(':')[0])
+    status_text = st.session_state.results_data['result']
+    if status_text.startswith("✅"):
+        st.success(status_text.split(':')[0].strip())
+    elif status_text.startswith("DB Error") or status_text.startswith("NLP failed"):
+        st.error(status_text.split(':')[0].strip())
+    elif status_text.startswith("Query Blocked") or status_text.startswith("Write blocked"):
+        st.warning(status_text.split(':')[0].strip())
+    else:
+        st.info(status_text)
+
 
 with col2:
     st.code(st.session_state.results_data.get("sql", "N/A"), language="sql", line_numbers=True)
