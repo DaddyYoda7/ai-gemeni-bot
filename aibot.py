@@ -6,7 +6,7 @@ import random
 import time
 
 # === API Setup ===
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or "AIzaSyDyv6AzhE-qjFUwUohlht4e8cCChDxa4jc"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-2.0-flash")
 chat_session = model.start_chat(history=[])
